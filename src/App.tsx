@@ -4,6 +4,7 @@ import { SupabaseProvider } from './context/SupabaseContext'
 import { clearSupabaseCache, hasCredentials } from './lib/supabase'
 import { ConnectPage } from './pages/ConnectPage'
 import { DashboardPage } from './pages/DashboardPage'
+import { PlanPage } from './pages/PlanPage'
 import { ProjectPage } from './pages/ProjectPage'
 
 export default function App() {
@@ -24,6 +25,7 @@ export default function App() {
     <SupabaseProvider>
       <Routes>
         <Route path="/" element={<DashboardPage />} />
+        <Route path="/plan" element={<PlanPage />} />
         <Route path="/project/:projectId" element={<ProjectPage />} />
         <Route
           path="/connect"

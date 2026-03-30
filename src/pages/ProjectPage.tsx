@@ -11,7 +11,6 @@ import { useSupabase } from '../context/SupabaseContext'
 import { formatDateTime } from '../lib/format'
 import { one } from '../lib/embed'
 import { Layout } from '../components/Layout'
-import { TagBadge } from '../components/TagBadge'
 
 type TagRow = { id: string; name: string }
 type NoteTagRow = {
@@ -31,6 +30,20 @@ type ProjectRow = {
   id: string
   name: string
   updated_at: string
+}
+
+type NoteDraft = { title: string; content: string; tagIds: Set<string> }
+
+function draftFromNote(n: NoteRow): NoteDraft {
+  return {
+    title: n.title ?? '',
+    content: n.content,
+    tagIds: new Set(
+      (n.note_tags ?? [])
+        .map((nt) => one(nt.tags)?.id)
+        .filter((id): id is string => Boolean(id)),
+    ),
+  }
 }
 
 async function replaceNoteTags(
@@ -101,6 +114,7 @@ export function ProjectPage() {
   const [filterTag, setFilterTag] = useState<string | null>(null)
   const [newTagName, setNewTagName] = useState('')
   const [savingTag, setSavingTag] = useState(false)
+  const [deletingTagId, setDeletingTagId] = useState<string | null>(null)
 
   const [newTitle, setNewTitle] = useState('')
   const [newContent, setNewContent] = useState('')
@@ -110,11 +124,16 @@ export function ProjectPage() {
   const [renameOpen, setRenameOpen] = useState(false)
   const [renameValue, setRenameValue] = useState('')
 
-  const [editingId, setEditingId] = useState<string | null>(null)
-  const [editTitle, setEditTitle] = useState('')
-  const [editContent, setEditContent] = useState('')
-  const [editTagIds, setEditTagIds] = useState<Set<string>>(new Set())
-  const [savingEdit, setSavingEdit] = useState(false)
+  const [noteDrafts, setNoteDrafts] = useState<Record<string, NoteDraft>>({})
+  const [savingNoteId, setSavingNoteId] = useState<string | null>(null)
+
+  useEffect(() => {
+    const next: Record<string, NoteDraft> = {}
+    for (const n of notes) {
+      next[n.id] = draftFromNote(n)
+    }
+    setNoteDrafts(next)
+  }, [notes])
 
   const load = useCallback(async () => {
     await Promise.resolve()
@@ -210,43 +229,53 @@ export function ProjectPage() {
     await load()
   }
 
-  function startEdit(n: NoteRow) {
-    setEditingId(n.id)
-    setEditTitle(n.title ?? '')
-    setEditContent(n.content)
-    const ids = new Set(
-      (n.note_tags ?? [])
-        .map((nt) => one(nt.tags)?.id)
-        .filter((id): id is string => Boolean(id)),
-    )
-    setEditTagIds(ids)
+  function draftFor(n: NoteRow): NoteDraft {
+    return noteDrafts[n.id] ?? draftFromNote(n)
   }
 
-  async function saveEdit() {
-    if (!editingId) return
-    setSavingEdit(true)
+  function setDraftFor(
+    n: NoteRow,
+    updater: (prev: NoteDraft) => NoteDraft,
+  ) {
+    setNoteDrafts((prev) => {
+      const cur = prev[n.id] ?? draftFromNote(n)
+      return { ...prev, [n.id]: updater(cur) }
+    })
+  }
+
+  function resetNoteDraft(n: NoteRow) {
+    setNoteDrafts((prev) => ({
+      ...prev,
+      [n.id]: draftFromNote(n),
+    }))
+  }
+
+  async function saveNote(noteId: string) {
+    const n = notes.find((x) => x.id === noteId)
+    if (!n) return
+    const d = draftFor(n)
+    setSavingNoteId(noteId)
     setError(null)
-    const title = editTitle.trim()
-    const content = editContent.trim()
+    const title = d.title.trim()
+    const content = d.content.trim()
     const { error: upErr } = await supabase
       .from('notes')
       .update({ title, content })
-      .eq('id', editingId)
+      .eq('id', noteId)
     if (upErr) {
       setError(upErr.message)
-      setSavingEdit(false)
+      setSavingNoteId(null)
       return
     }
     try {
-      await replaceNoteTags(supabase, editingId, [...editTagIds])
+      await replaceNoteTags(supabase, noteId, [...d.tagIds])
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Failed to save tags'
       setError(message)
-      setSavingEdit(false)
+      setSavingNoteId(null)
       return
     }
-    setEditingId(null)
-    setSavingEdit(false)
+    setSavingNoteId(null)
     await load()
   }
 
@@ -293,6 +322,42 @@ export function ProjectPage() {
       return
     }
     setNewTagName('')
+    await load()
+  }
+
+  async function handleDeleteTag(t: TagRow) {
+    if (
+      !confirm(
+        `Delete tag #${t.name}? It will be removed from every note that uses it.`,
+      )
+    ) {
+      return
+    }
+    setDeletingTagId(t.id)
+    setError(null)
+    const { error: delErr } = await supabase.from('tags').delete().eq('id', t.id)
+    setDeletingTagId(null)
+    if (delErr) {
+      setError(delErr.message)
+      return
+    }
+    if (filterTag === t.name) setFilterTag(null)
+    setNewTagIds((prev) => {
+      const next = new Set(prev)
+      next.delete(t.id)
+      return next
+    })
+    setNoteDrafts((prev) => {
+      const next: Record<string, NoteDraft> = { ...prev }
+      for (const id of Object.keys(next)) {
+        const d = next[id]
+        if (!d.tagIds.has(t.id)) continue
+        const tagIds = new Set(d.tagIds)
+        tagIds.delete(t.id)
+        next[id] = { ...d, tagIds }
+      }
+      return next
+    })
     await load()
   }
 
@@ -491,20 +556,33 @@ export function ProjectPage() {
                 All
               </button>
               {tags.map((t) => (
-                <button
+                <span
                   key={t.id}
-                  type="button"
-                  onClick={() =>
-                    setFilterTag((prev) => (prev === t.name ? null : t.name))
-                  }
-                  className={`rounded-full px-3 py-1 text-xs font-medium ${
-                    filterTag === t.name
-                      ? 'bg-violet-600 text-white'
-                      : 'bg-slate-200 text-slate-800 dark:bg-slate-800 dark:text-slate-200'
-                  }`}
+                  className="inline-flex items-center gap-0.5 rounded-full border border-slate-200 bg-slate-50 pl-0.5 dark:border-slate-700 dark:bg-slate-900/80"
                 >
-                  #{t.name}
-                </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setFilterTag((prev) => (prev === t.name ? null : t.name))
+                    }
+                    className={`rounded-full px-2.5 py-1 text-xs font-medium ${
+                      filterTag === t.name
+                        ? 'bg-violet-600 text-white'
+                        : 'text-slate-800 dark:text-slate-200'
+                    }`}
+                  >
+                    #{t.name}
+                  </button>
+                  <button
+                    type="button"
+                    title={`Delete tag #${t.name}`}
+                    disabled={deletingTagId === t.id}
+                    onClick={() => void handleDeleteTag(t)}
+                    className="mr-0.5 rounded-full px-1.5 py-0.5 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-50 dark:text-red-400 dark:hover:bg-red-950/50"
+                  >
+                    {deletingTagId === t.id ? '…' : '×'}
+                  </button>
+                </span>
               ))}
             </div>
 
@@ -516,12 +594,14 @@ export function ProjectPage() {
                     : 'No notes yet.'}
                 </li>
               ) : (
-                filteredNotes.map((n) => (
-                  <li
-                    key={n.id}
-                    className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900"
-                  >
-                    {editingId === n.id ? (
+                filteredNotes.map((n) => {
+                  const d = draftFor(n)
+                  const saving = savingNoteId === n.id
+                  return (
+                    <li
+                      key={n.id}
+                      className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900"
+                    >
                       <div className="flex flex-col gap-3">
                         <label className="flex flex-col gap-1 text-sm">
                           <span className="font-medium text-slate-700 dark:text-slate-300">
@@ -530,82 +610,67 @@ export function ProjectPage() {
                           <input
                             type="text"
                             placeholder="Optional"
-                            value={editTitle}
-                            onChange={(e) => setEditTitle(e.target.value)}
+                            value={d.title}
+                            onChange={(e) =>
+                              setDraftFor(n, (prev) => ({
+                                ...prev,
+                                title: e.target.value,
+                              }))
+                            }
                             className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 dark:border-slate-600 dark:bg-slate-950 dark:text-slate-100"
                           />
                         </label>
                         <textarea
                           rows={4}
-                          value={editContent}
-                          onChange={(e) => setEditContent(e.target.value)}
+                          value={d.content}
+                          onChange={(e) =>
+                            setDraftFor(n, (prev) => ({
+                              ...prev,
+                              content: e.target.value,
+                            }))
+                          }
                           className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 dark:border-slate-600 dark:bg-slate-950 dark:text-slate-100"
                         />
                         <TagToggle
                           tags={tags}
-                          selected={editTagIds}
-                          onChange={setEditTagIds}
+                          selected={d.tagIds}
+                          onChange={(next) =>
+                            setDraftFor(n, (prev) => ({ ...prev, tagIds: next }))
+                          }
                         />
-                        <div className="flex gap-2">
-                          <button
-                            type="button"
-                            className="rounded-lg bg-violet-600 px-3 py-1.5 text-sm font-semibold text-white"
-                            onClick={() => void saveEdit()}
-                            disabled={savingEdit}
-                          >
-                            {savingEdit ? 'Saving…' : 'Save'}
-                          </button>
-                          <button
-                            type="button"
-                            className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm dark:border-slate-600"
-                            onClick={() => setEditingId(null)}
-                            disabled={savingEdit}
-                          >
-                            Cancel
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <>
-                        {n.title?.trim() ? (
-                          <h3 className="mb-2 text-base font-semibold text-slate-900 dark:text-white">
-                            {n.title.trim()}
-                          </h3>
-                        ) : null}
-                        <p className="whitespace-pre-wrap text-slate-900 dark:text-slate-100">
-                          {n.content}
-                        </p>
-                        <div className="mt-2 flex flex-wrap gap-1.5">
-                          {(n.note_tags ?? []).map((nt) => {
-                            const t = one(nt.tags)
-                            return t ? (
-                              <TagBadge key={nt.tag_id} name={t.name} />
-                            ) : null
-                          })}
-                        </div>
-                        <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-3 text-xs text-slate-500 dark:border-slate-800 dark:text-slate-400">
+                        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-3 text-xs text-slate-500 dark:border-slate-800 dark:text-slate-400">
                           <span>{formatDateTime(n.created_at)}</span>
-                          <div className="flex gap-2">
+                          <div className="flex flex-wrap gap-2">
                             <button
                               type="button"
-                              className="font-medium text-violet-600 dark:text-violet-400"
-                              onClick={() => startEdit(n)}
+                              className="rounded-lg bg-violet-600 px-3 py-1.5 text-sm font-semibold text-white"
+                              onClick={() => void saveNote(n.id)}
+                              disabled={saving}
                             >
-                              Edit
+                              {saving ? 'Saving…' : 'Save'}
                             </button>
                             <button
                               type="button"
-                              className="font-medium text-red-600 dark:text-red-400"
+                              className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm dark:border-slate-600"
+                              onClick={() => resetNoteDraft(n)}
+                              disabled={saving}
+                            >
+                              Reset
+                            </button>
+                            <button
+                              type="button"
+                              className="rounded-lg px-3 py-1.5 text-sm font-medium text-red-600 dark:text-red-400"
                               onClick={() => void deleteNote(n.id)}
+                              disabled={saving}
                             >
                               Delete
                             </button>
                           </div>
                         </div>
-                      </>
-                    )}
-                  </li>
-                ))
+                      </div>
+                    </li>
+                  )
+                })
               )}
             </ul>
           </section>
